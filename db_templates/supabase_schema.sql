@@ -219,7 +219,345 @@ COMMENT ON COLUMN learning_metrics.improvement IS 'Quality improvement vs previo
 CREATE INDEX IF NOT EXISTS idx_learning_metrics_run ON learning_metrics(run_id);
 CREATE INDEX IF NOT EXISTS idx_learning_metrics_created ON learning_metrics(created_at DESC);
 
--- ==================== Functions ====================
+-- ==================== Vector DB (pgvector) ====================
+
+-- Enable pgvector extension
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- File Embeddings: 파일 임베딩 캐싱 및 검색
+CREATE TABLE IF NOT EXISTS file_embeddings (
+  id SERIAL PRIMARY KEY,
+  file_path TEXT UNIQUE NOT NULL,
+  content_hash VARCHAR(64) NOT NULL,
+  embedding VECTOR(768),
+  file_type VARCHAR(20),
+  file_size INT,
+  line_count INT,
+  last_modified TIMESTAMPTZ,
+
+  -- 사용 통계
+  usage_count INT DEFAULT 0,
+  last_used_at TIMESTAMPTZ,
+  avg_attention_weight FLOAT DEFAULT 0.0,
+
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+COMMENT ON TABLE file_embeddings IS 'File embeddings cache with usage statistics';
+COMMENT ON COLUMN file_embeddings.content_hash IS 'SHA-256 hash for change detection';
+COMMENT ON COLUMN file_embeddings.embedding IS '768-dim vector from nomic-embed-text';
+COMMENT ON COLUMN file_embeddings.usage_count IS 'How many times this file was selected';
+COMMENT ON COLUMN file_embeddings.avg_attention_weight IS 'Average attention weight across all uses';
+
+-- HNSW index for fast approximate nearest neighbor search
+CREATE INDEX IF NOT EXISTS idx_file_embeddings_vector
+  ON file_embeddings USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_file_embeddings_path ON file_embeddings(file_path);
+CREATE INDEX IF NOT EXISTS idx_file_embeddings_usage ON file_embeddings(usage_count DESC);
+
+-- Execution Contexts: Run 실행 컨텍스트 (학습의 핵심!)
+CREATE TABLE IF NOT EXISTS execution_contexts (
+  id SERIAL PRIMARY KEY,
+  run_id VARCHAR(10) NOT NULL,
+  task_id VARCHAR(10) NOT NULL,
+
+  -- 사용자 요청
+  user_request TEXT NOT NULL,
+  request_embedding VECTOR(768),
+  task_category VARCHAR(50),
+
+  -- 실행 결과
+  quality_score FLOAT,
+  execution_time FLOAT,
+  tokens_used INT,
+
+  -- 상태
+  executed BOOLEAN DEFAULT TRUE,
+  success BOOLEAN DEFAULT FALSE,
+  error_message TEXT,
+
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+
+  FOREIGN KEY (run_id) REFERENCES process_runs(run_id) ON DELETE CASCADE
+);
+
+COMMENT ON TABLE execution_contexts IS 'Execution contexts for learning from past runs';
+COMMENT ON COLUMN execution_contexts.request_embedding IS 'User request embedding for similarity search';
+COMMENT ON COLUMN execution_contexts.task_category IS 'Auto-classified task type (bug_fix, feature, refactor, etc)';
+COMMENT ON COLUMN execution_contexts.success IS 'Was this execution successful?';
+
+-- HNSW index for similar request search
+CREATE INDEX IF NOT EXISTS idx_execution_contexts_vector
+  ON execution_contexts USING hnsw (request_embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_execution_contexts_run ON execution_contexts(run_id);
+CREATE INDEX IF NOT EXISTS idx_execution_contexts_success ON execution_contexts(success);
+CREATE INDEX IF NOT EXISTS idx_execution_contexts_quality ON execution_contexts(quality_score DESC);
+CREATE INDEX IF NOT EXISTS idx_execution_contexts_category ON execution_contexts(task_category);
+
+-- Selected Files: 선택된 파일과 Attention weights
+CREATE TABLE IF NOT EXISTS selected_files (
+  id SERIAL PRIMARY KEY,
+  context_id INT NOT NULL,
+  file_path TEXT NOT NULL,
+
+  -- Attention 정보
+  attention_weight FLOAT NOT NULL,
+  attention_rank INT,
+
+  -- 유용성 판단
+  was_useful BOOLEAN,
+  usefulness_score FLOAT,
+
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+
+  FOREIGN KEY (context_id) REFERENCES execution_contexts(id) ON DELETE CASCADE,
+  FOREIGN KEY (file_path) REFERENCES file_embeddings(file_path) ON DELETE CASCADE
+);
+
+COMMENT ON TABLE selected_files IS 'Files selected by Attention mechanism with their weights';
+COMMENT ON COLUMN selected_files.attention_weight IS 'Attention weight (0~1)';
+COMMENT ON COLUMN selected_files.attention_rank IS 'Rank in Top-K selection';
+COMMENT ON COLUMN selected_files.was_useful IS 'Was this file actually useful? (quality-based)';
+COMMENT ON COLUMN selected_files.usefulness_score IS 'How useful was this file? (0~1)';
+
+CREATE INDEX IF NOT EXISTS idx_selected_files_context ON selected_files(context_id);
+CREATE INDEX IF NOT EXISTS idx_selected_files_path ON selected_files(file_path);
+CREATE INDEX IF NOT EXISTS idx_selected_files_useful ON selected_files(was_useful);
+CREATE INDEX IF NOT EXISTS idx_selected_files_weight ON selected_files(attention_weight DESC);
+
+-- File-Task Affinity: 파일과 작업 타입 간 학습된 연관성
+CREATE TABLE IF NOT EXISTS file_task_affinity (
+  file_path TEXT NOT NULL,
+  task_category VARCHAR(50) NOT NULL,
+
+  -- 학습된 통계
+  success_count INT DEFAULT 0,
+  failure_count INT DEFAULT 0,
+  total_uses INT DEFAULT 0,
+
+  avg_quality FLOAT DEFAULT 0.0,
+  avg_attention_weight FLOAT DEFAULT 0.0,
+  avg_usefulness FLOAT DEFAULT 0.0,
+
+  -- 학습된 가중치 (유사 Weights 테이블)
+  learned_importance FLOAT DEFAULT 0.5,
+  confidence FLOAT DEFAULT 0.0,
+
+  last_updated TIMESTAMPTZ DEFAULT NOW(),
+
+  PRIMARY KEY (file_path, task_category),
+  FOREIGN KEY (file_path) REFERENCES file_embeddings(file_path) ON DELETE CASCADE
+);
+
+COMMENT ON TABLE file_task_affinity IS 'Learned affinity between files and task categories';
+COMMENT ON COLUMN file_task_affinity.learned_importance IS 'Learned importance weight (0~1)';
+COMMENT ON COLUMN file_task_affinity.confidence IS 'Confidence based on sample size (0~1)';
+
+CREATE INDEX IF NOT EXISTS idx_affinity_file ON file_task_affinity(file_path);
+CREATE INDEX IF NOT EXISTS idx_affinity_category ON file_task_affinity(task_category);
+CREATE INDEX IF NOT EXISTS idx_affinity_importance ON file_task_affinity(learned_importance DESC);
+
+-- File Co-occurrence: 함께 사용되는 파일 패턴
+CREATE TABLE IF NOT EXISTS file_co_occurrence (
+  file_a TEXT NOT NULL,
+  file_b TEXT NOT NULL,
+
+  co_occurrence_count INT DEFAULT 0,
+  avg_quality_when_together FLOAT DEFAULT 0.0,
+  correlation_strength FLOAT DEFAULT 0.0,
+
+  last_occurred TIMESTAMPTZ DEFAULT NOW(),
+
+  PRIMARY KEY (file_a, file_b),
+  FOREIGN KEY (file_a) REFERENCES file_embeddings(file_path) ON DELETE CASCADE,
+  FOREIGN KEY (file_b) REFERENCES file_embeddings(file_path) ON DELETE CASCADE,
+
+  CHECK (file_a < file_b)  -- Ensure ordering to avoid duplicates
+);
+
+COMMENT ON TABLE file_co_occurrence IS 'Files that are frequently used together';
+COMMENT ON COLUMN file_co_occurrence.correlation_strength IS 'How strongly correlated (0~1)';
+
+CREATE INDEX IF NOT EXISTS idx_co_occurrence_a ON file_co_occurrence(file_a);
+CREATE INDEX IF NOT EXISTS idx_co_occurrence_b ON file_co_occurrence(file_b);
+CREATE INDEX IF NOT EXISTS idx_co_occurrence_strength ON file_co_occurrence(correlation_strength DESC);
+
+-- ==================== Vector Search Functions ====================
+
+-- 1. Find similar files by embedding
+CREATE OR REPLACE FUNCTION match_files(
+  query_embedding VECTOR(768),
+  match_threshold FLOAT DEFAULT 0.5,
+  match_count INT DEFAULT 10
+)
+RETURNS TABLE (
+  file_path TEXT,
+  similarity FLOAT,
+  usage_count INT,
+  avg_attention_weight FLOAT
+)
+LANGUAGE SQL
+STABLE
+AS $$
+  SELECT
+    file_path,
+    1 - (embedding <=> query_embedding) AS similarity,
+    usage_count,
+    avg_attention_weight
+  FROM file_embeddings
+  WHERE 1 - (embedding <=> query_embedding) >= match_threshold
+  ORDER BY embedding <=> query_embedding
+  LIMIT match_count;
+$$;
+
+COMMENT ON FUNCTION match_files IS 'Find similar files by embedding vector';
+
+-- 2. Find similar execution contexts (past experiences)
+CREATE OR REPLACE FUNCTION match_contexts(
+  query_embedding VECTOR(768),
+  success_only BOOLEAN DEFAULT TRUE,
+  min_quality FLOAT DEFAULT 0.7,
+  match_count INT DEFAULT 20
+)
+RETURNS TABLE (
+  context_id INT,
+  run_id VARCHAR(10),
+  task_id VARCHAR(10),
+  user_request TEXT,
+  similarity FLOAT,
+  quality_score FLOAT,
+  task_category VARCHAR(50)
+)
+LANGUAGE SQL
+STABLE
+AS $$
+  SELECT
+    id AS context_id,
+    run_id,
+    task_id,
+    user_request,
+    1 - (request_embedding <=> query_embedding) AS similarity,
+    quality_score,
+    task_category
+  FROM execution_contexts
+  WHERE
+    (NOT success_only OR success = TRUE)
+    AND quality_score >= min_quality
+  ORDER BY request_embedding <=> query_embedding
+  LIMIT match_count;
+$$;
+
+COMMENT ON FUNCTION match_contexts IS 'Find similar past execution contexts';
+
+-- 3. Get recommended files for a task category
+CREATE OR REPLACE FUNCTION recommend_files_for_category(
+  category VARCHAR(50),
+  min_confidence FLOAT DEFAULT 0.3,
+  limit_count INT DEFAULT 10
+)
+RETURNS TABLE (
+  file_path TEXT,
+  learned_importance FLOAT,
+  avg_quality FLOAT,
+  total_uses INT,
+  confidence FLOAT
+)
+LANGUAGE SQL
+STABLE
+AS $$
+  SELECT
+    file_path,
+    learned_importance,
+    avg_quality,
+    total_uses,
+    confidence
+  FROM file_task_affinity
+  WHERE
+    task_category = category
+    AND confidence >= min_confidence
+  ORDER BY learned_importance DESC, avg_quality DESC
+  LIMIT limit_count;
+$$;
+
+COMMENT ON FUNCTION recommend_files_for_category IS 'Get recommended files for a task category based on learned affinity';
+
+-- 4. Get co-occurring files (files that work well together)
+CREATE OR REPLACE FUNCTION get_co_occurring_files(
+  target_file TEXT,
+  min_correlation FLOAT DEFAULT 0.3,
+  limit_count INT DEFAULT 5
+)
+RETURNS TABLE (
+  related_file TEXT,
+  co_occurrence_count INT,
+  avg_quality_when_together FLOAT,
+  correlation_strength FLOAT
+)
+LANGUAGE SQL
+STABLE
+AS $$
+  SELECT
+    CASE
+      WHEN file_a = target_file THEN file_b
+      ELSE file_a
+    END AS related_file,
+    co_occurrence_count,
+    avg_quality_when_together,
+    correlation_strength
+  FROM file_co_occurrence
+  WHERE
+    (file_a = target_file OR file_b = target_file)
+    AND correlation_strength >= min_correlation
+  ORDER BY correlation_strength DESC, co_occurrence_count DESC
+  LIMIT limit_count;
+$$;
+
+COMMENT ON FUNCTION get_co_occurring_files IS 'Find files that frequently co-occur with target file';
+
+-- 5. Get useful files from similar contexts (핵심 함수!)
+CREATE OR REPLACE FUNCTION get_learned_file_recommendations(
+  query_embedding VECTOR(768),
+  success_only BOOLEAN DEFAULT TRUE,
+  min_quality FLOAT DEFAULT 0.7,
+  min_usefulness FLOAT DEFAULT 0.5,
+  limit_count INT DEFAULT 10
+)
+RETURNS TABLE (
+  file_path TEXT,
+  recommendation_score FLOAT,
+  avg_attention_weight FLOAT,
+  avg_usefulness_score FLOAT,
+  times_selected INT,
+  avg_context_similarity FLOAT
+)
+LANGUAGE SQL
+STABLE
+AS $$
+  SELECT
+    sf.file_path,
+    -- Recommendation score: combines attention, usefulness, and context similarity
+    AVG((1 - (ec.request_embedding <=> query_embedding)) * sf.attention_weight * sf.usefulness_score) AS recommendation_score,
+    AVG(sf.attention_weight) AS avg_attention_weight,
+    AVG(sf.usefulness_score) AS avg_usefulness_score,
+    COUNT(*) AS times_selected,
+    AVG(1 - (ec.request_embedding <=> query_embedding)) AS avg_context_similarity
+  FROM execution_contexts ec
+  JOIN selected_files sf ON ec.id = sf.context_id
+  WHERE
+    (NOT success_only OR ec.success = TRUE)
+    AND ec.quality_score >= min_quality
+    AND sf.was_useful = TRUE
+    AND sf.usefulness_score >= min_usefulness
+  GROUP BY sf.file_path
+  HAVING AVG(1 - (ec.request_embedding <=> query_embedding)) >= 0.5
+  ORDER BY recommendation_score DESC
+  LIMIT limit_count;
+$$;
+
+COMMENT ON FUNCTION get_learned_file_recommendations IS 'Get file recommendations based on learned patterns from similar contexts';
+
+-- ==================== Utility Functions ====================
 
 -- Auto-update timestamp function
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -233,6 +571,12 @@ $$ language 'plpgsql';
 -- Trigger for neural_tasks
 CREATE TRIGGER update_neural_tasks_updated_at
     BEFORE UPDATE ON neural_tasks
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
+
+-- Trigger for file_embeddings
+CREATE TRIGGER update_file_embeddings_updated_at
+    BEFORE UPDATE ON file_embeddings
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 

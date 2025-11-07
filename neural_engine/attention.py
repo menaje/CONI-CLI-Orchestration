@@ -321,6 +321,274 @@ def visualize_attention(attention_weights: np.ndarray,
     return "\n".join(lines)
 
 
+class EnhancedAttention:
+    """
+    Enhanced Attention with Memory: 과거 학습을 활용한 파일 선택
+
+    기존 Attention + Vector Memory를 결합:
+    - 첫 Run: 순수 Attention으로 파일 선택
+    - 이후 Run: 과거 경험 + Attention 결합
+    - Run 간 학습 누적 (점점 더 똑똑해짐)
+    """
+
+    def __init__(self,
+                 embedding_engine: Optional[EmbeddingEngine] = None,
+                 vector_memory=None):
+        """
+        Args:
+            embedding_engine: 임베딩 엔진
+            vector_memory: VectorMemory 인스턴스 (None이면 메모리 없음)
+        """
+        self.embedding_engine = embedding_engine or get_embedding_engine()
+        self.attention = AttentionMechanism(self.embedding_engine)
+        self.vector_memory = vector_memory
+
+    def select_files_with_memory(self,
+                                 task_purpose: str,
+                                 candidate_files: List[str],
+                                 top_k: int = 3,
+                                 memory_weight: float = 0.3,
+                                 threshold: float = 0.1) -> List[Tuple[str, float]]:
+        """
+        메모리를 활용한 파일 선택 (핵심 기능!)
+
+        Args:
+            task_purpose: Task 목적 (자연어)
+            candidate_files: 후보 파일 리스트
+            top_k: 선택할 개수
+            memory_weight: 메모리 가중치 (0~1, 기본 0.3)
+            threshold: 최소 점수
+
+        Returns:
+            [(file_path, combined_score), ...] 리스트
+        """
+        # 1. 기본 Attention 계산
+        query_emb = self.embedding_engine.embed_text(task_purpose)
+        key_embs = [
+            self.embedding_engine.embed_file(file_path)
+            for file_path in candidate_files
+        ]
+
+        base_scores = self.attention.compute_attention_scores(query_emb, key_embs)
+        base_weights = self.attention.softmax(base_scores)
+
+        # 2. 메모리 기반 부스팅 (Vector Memory 있을 때만)
+        memory_scores = {}
+        if self.vector_memory is not None:
+            try:
+                # 과거 학습된 추천 가져오기
+                learned_recs = self.vector_memory.get_learned_recommendations(
+                    task_purpose,
+                    success_only=True,
+                    min_quality=0.7,
+                    limit_count=top_k * 2
+                )
+
+                # 추천 점수 정규화
+                if learned_recs:
+                    max_score = max(r['recommendation_score'] for r in learned_recs)
+                    for rec in learned_recs:
+                        file_path = rec['file_path']
+                        if file_path in candidate_files:
+                            normalized_score = rec['recommendation_score'] / max_score
+                            memory_scores[file_path] = normalized_score
+
+                print(f"[EnhancedAttention] Memory boost: {len(memory_scores)} files")
+            except Exception as e:
+                print(f"[WARNING] Memory lookup failed: {e}")
+
+        # 3. 결합 점수 계산 (Attention + Memory)
+        attention_weight = 1.0 - memory_weight
+        final_scores = {}
+
+        for i, file_path in enumerate(candidate_files):
+            attention_score = base_weights[i]
+            memory_boost = memory_scores.get(file_path, 0.0)
+
+            # 가중 결합
+            combined_score = (attention_weight * attention_score +
+                            memory_weight * memory_boost)
+
+            final_scores[file_path] = combined_score
+
+        # 4. Top-K 선택
+        sorted_files = sorted(final_scores.items(),
+                             key=lambda x: x[1],
+                             reverse=True)
+
+        # 임계값 필터링
+        filtered = [(f, s) for f, s in sorted_files if s >= threshold]
+
+        return filtered[:top_k]
+
+    def select_files_with_explanation(self,
+                                     task_purpose: str,
+                                     candidate_files: List[str],
+                                     top_k: int = 3) -> Dict:
+        """
+        설명과 함께 파일 선택 (디버깅용)
+
+        Returns:
+            {
+                "selected": [(file, score), ...],
+                "attention_only": [(file, score), ...],
+                "memory_only": [(file, score), ...],
+                "explanation": str
+            }
+        """
+        # Attention만
+        selector = TaskAttentionSelector(self.embedding_engine)
+        attention_only = selector.select_files(task_purpose, candidate_files, top_k)
+
+        # Memory 포함
+        memory_combined = self.select_files_with_memory(
+            task_purpose, candidate_files, top_k
+        )
+
+        # Memory만 (있을 경우)
+        memory_only = []
+        if self.vector_memory is not None:
+            try:
+                learned = self.vector_memory.get_learned_recommendations(
+                    task_purpose, limit_count=top_k
+                )
+                memory_only = [(r['file_path'], r['recommendation_score'])
+                              for r in learned if r['file_path'] in candidate_files]
+            except:
+                pass
+
+        # 설명 생성
+        explanation = self._generate_explanation(
+            attention_only, memory_only, memory_combined
+        )
+
+        return {
+            "selected": memory_combined,
+            "attention_only": attention_only,
+            "memory_only": memory_only,
+            "explanation": explanation
+        }
+
+    def _generate_explanation(self, attention_only, memory_only, combined) -> str:
+        """선택 이유 설명 생성"""
+        lines = ["File Selection Explanation:", "=" * 60]
+
+        lines.append("\nAttention-based selection:")
+        for file, score in attention_only[:3]:
+            lines.append(f"  {file}: {score:.3f}")
+
+        if memory_only:
+            lines.append("\nMemory-based recommendations:")
+            for file, score in memory_only[:3]:
+                lines.append(f"  {file}: {score:.3f}")
+        else:
+            lines.append("\nNo memory data available (first run)")
+
+        lines.append("\nFinal selection (Attention + Memory):")
+        for file, score in combined:
+            lines.append(f"  {file}: {score:.3f}")
+
+        return "\n".join(lines)
+
+
+class SmartFileSelector:
+    """
+    Smart File Selector: 자동으로 최적의 선택 전략 사용
+
+    - Vector Memory 있으면: EnhancedAttention 사용
+    - 없으면: 기본 Attention 사용
+    """
+
+    def __init__(self,
+                 embedding_engine: Optional[EmbeddingEngine] = None,
+                 enable_memory: bool = True):
+        """
+        Args:
+            embedding_engine: 임베딩 엔진
+            enable_memory: Vector Memory 활성화 여부
+        """
+        self.embedding_engine = embedding_engine or get_embedding_engine()
+
+        # Vector Memory 초기화 시도
+        self.vector_memory = None
+        if enable_memory:
+            try:
+                from .vector_memory import get_vector_memory
+                self.vector_memory = get_vector_memory()
+                print("[SmartFileSelector] Vector Memory enabled")
+            except Exception as e:
+                print(f"[SmartFileSelector] Vector Memory not available: {e}")
+
+        # Selector 생성
+        if self.vector_memory:
+            self.selector = EnhancedAttention(self.embedding_engine, self.vector_memory)
+        else:
+            self.selector = TaskAttentionSelector(self.embedding_engine)
+
+    def select_files(self,
+                    task_purpose: str,
+                    candidate_files: List[str],
+                    top_k: int = 3,
+                    threshold: float = 0.1) -> List[Tuple[str, float]]:
+        """
+        파일 선택 (자동으로 최적 전략 사용)
+
+        Args:
+            task_purpose: Task 목적
+            candidate_files: 후보 파일들
+            top_k: 선택할 개수
+            threshold: 최소 점수
+
+        Returns:
+            [(file_path, score), ...]
+        """
+        if isinstance(self.selector, EnhancedAttention):
+            # Memory 활용
+            return self.selector.select_files_with_memory(
+                task_purpose, candidate_files, top_k, threshold=threshold
+            )
+        else:
+            # 기본 Attention
+            return self.selector.select_files(
+                task_purpose, candidate_files, top_k, threshold
+            )
+
+    def save_execution_result(self,
+                             run_id: str,
+                             task_id: str,
+                             user_request: str,
+                             selected_files: List[Tuple[str, float]],
+                             quality_score: float,
+                             success: bool,
+                             execution_time: float = 0.0):
+        """
+        실행 결과 저장 (학습)
+
+        Args:
+            run_id: Run ID
+            task_id: Task ID
+            user_request: 사용자 요청
+            selected_files: 선택된 파일들
+            quality_score: 품질 점수
+            success: 성공 여부
+            execution_time: 실행 시간
+        """
+        if self.vector_memory:
+            try:
+                self.vector_memory.save_execution_context(
+                    run_id=run_id,
+                    task_id=task_id,
+                    user_request=user_request,
+                    quality_score=quality_score,
+                    success=success,
+                    selected_files=selected_files,
+                    execution_time=execution_time
+                )
+                print(f"[SmartFileSelector] Saved execution result for learning")
+            except Exception as e:
+                print(f"[WARNING] Failed to save execution result: {e}")
+
+
 if __name__ == "__main__":
     """테스트 코드"""
     print("=" * 60)
