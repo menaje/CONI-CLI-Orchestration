@@ -51,9 +51,25 @@ neural:
 
 # 데이터베이스 설정
 database:
-  weights: "db/weights.json"
-  execution_history: "db/execution_history.md"
-  learning_metrics: "db/learning_metrics.md"
+  # auto: Supabase 우선, 환경변수 없으면 Markdown
+  # supabase: Supabase 강제 사용
+  # markdown: Markdown 강제 사용 (파일 기반)
+  mode: "auto"
+
+  # Supabase 설정
+  supabase:
+    # 환경변수 사용 (권장):
+    #   export SUPABASE_URL=https://xxxxx.supabase.co
+    #   export SUPABASE_KEY=eyJhbGc...
+    # 또는 여기에 직접 설정 (비권장 - 보안 위험):
+    # url: "https://xxxxx.supabase.co"
+    # key: "eyJhbGc..."
+
+  # Markdown 설정 (fallback)
+  markdown:
+    weights: "db/weights.json"
+    execution_history: "db/execution_history.md"
+    learning_metrics: "db/learning_metrics.md"
 
 # 로깅 설정
 logging:
