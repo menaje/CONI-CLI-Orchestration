@@ -1,0 +1,61 @@
+# Neural-CONI Configuration
+
+# Embedding Provider 설정
+embedding:
+  # auto: 자동 감지 (Ollama → LM Studio 순서로 시도)
+  # ollama: Ollama 강제 사용
+  # lmstudio: LM Studio 강제 사용
+  provider: "auto"
+
+  # Ollama 설정
+  ollama:
+    base_url: "http://localhost:11434/v1"
+    model: "nomic-embed-text"  # 추천: 빠르고 품질 좋음 (768-dim)
+    # 다른 옵션:
+    # - mxbai-embed-large (1024-dim, 더 높은 품질)
+    # - bge-m3 (1024-dim, 다국어 지원)
+
+  # LM Studio 설정
+  lmstudio:
+    base_url: "http://localhost:1234/v1"
+    model: "nomic-embed-text"
+
+  # 캐시 설정
+  cache:
+    enabled: true
+    path: "db/embeddings_cache.json"
+    auto_save_interval: 10  # N개마다 자동 저장
+
+# Neural Network 설정
+neural:
+  # 학습률
+  learning_rate: 0.01
+
+  # 활성화 임계값 (Task 중요도별)
+  thresholds:
+    critical: 0.8   # 최종 산출물
+    high: 0.7       # 주요 중간 산출물
+    medium: 0.6     # 기본값
+    low: 0.4        # 보조 정보
+
+  # Attention 설정
+  attention:
+    top_k: 3        # Top-K 파일 선택
+    min_similarity: 0.3  # 최소 유사도
+
+  # 품질 평가 가중치
+  quality_weights:
+    relevance: 0.4      # 관련성
+    completeness: 0.3   # 완성도
+    coherence: 0.3      # 일관성
+
+# 데이터베이스 설정
+database:
+  weights: "db/weights.json"
+  execution_history: "db/execution_history.md"
+  learning_metrics: "db/learning_metrics.md"
+
+# 로깅 설정
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "[{level}] {message}"

@@ -1,11 +1,14 @@
 """
-Embedding Engine: 텍스트를 벡터로 변환하고 수학적 연산 수행
+Unified Embedding Engine: Ollama/LM Studio 통합 임베딩 엔진
+
+OpenAI SDK 사용으로 Ollama와 LM Studio를 동일한 인터페이스로 사용
 
 기능:
-- 텍스트 → 384차원 벡터 변환
-- 파일 내용 임베딩
+- Ollama/LM Studio 임베딩 지원 (OpenAI 호환 API)
+- 텍스트 → 벡터 변환 (768-dim, nomic-embed-text 기본)
+- 배치 임베딩 (효율적)
 - 코사인 유사도 계산
-- 임베딩 캐싱 (성능 최적화)
+- 메모리 캐싱 (성능 최적화)
 """
 
 import os
@@ -15,44 +18,113 @@ from typing import List, Dict, Optional, Tuple
 import numpy as np
 from pathlib import Path
 
-# Lazy import to avoid loading model unless needed
-_model = None
-
-def get_model():
-    """임베딩 모델 로딩 (지연 로딩)"""
-    global _model
-    if _model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            print("[EmbeddingEngine] Loading sentence-transformers model...")
-            _model = SentenceTransformer('all-MiniLM-L6-v2')
-            print("[EmbeddingEngine] Model loaded successfully (14MB, 384 dimensions)")
-        except ImportError:
-            print("[ERROR] sentence-transformers not installed!")
-            print("Run: pip install sentence-transformers")
-            raise
-    return _model
+# OpenAI SDK (Ollama, LM Studio 둘 다 사용)
+try:
+    from openai import OpenAI
+except ImportError:
+    print("[ERROR] openai package not installed!")
+    print("Run: pip install openai")
+    raise
 
 
-class EmbeddingEngine:
+class UnifiedEmbeddingEngine:
     """
-    임베딩 엔진: 모든 텍스트-벡터 변환 담당
+    통합 임베딩 엔진: Ollama/LM Studio를 OpenAI SDK로 통합
 
     Features:
-    - 로컬 실행 (무료, CPU 충분)
-    - 캐싱으로 중복 계산 방지
-    - 빠른 유사도 계산
+    - Ollama/LM Studio 자동 선택
+    - 로컬 실행 (무료, 빠름)
+    - 배치 처리 지원
+    - 메모리 캐싱
     """
 
-    def __init__(self, cache_path: str = "db/embeddings_cache.json"):
+    def __init__(
+        self,
+        provider: str = "ollama",
+        model: str = None,
+        base_url: str = None,
+        cache_path: str = "db/embeddings_cache.json",
+        auto_detect: bool = True
+    ):
         """
         Args:
-            cache_path: 임베딩 캐시 파일 경로
+            provider: "ollama" or "lmstudio"
+            model: 임베딩 모델 이름 (None이면 기본값)
+            base_url: API URL (None이면 기본값)
+            cache_path: 캐시 파일 경로
+            auto_detect: 자동으로 사용 가능한 provider 찾기
         """
         self.cache_path = cache_path
         self.cache = self._load_cache()
-        self.model = get_model()
-        self.dimension = 384  # all-MiniLM-L6-v2 dimension
+
+        # Provider별 기본값
+        providers_config = {
+            "ollama": {
+                "base_url": base_url or "http://localhost:11434/v1",
+                "model": model or "nomic-embed-text",
+                "dimension": 768
+            },
+            "lmstudio": {
+                "base_url": base_url or "http://localhost:1234/v1",
+                "model": model or "nomic-embed-text",
+                "dimension": 768
+            }
+        }
+
+        # Auto-detect: 사용 가능한 provider 찾기
+        if auto_detect:
+            provider = self._detect_provider(providers_config)
+
+        if provider not in providers_config:
+            raise ValueError(f"Unknown provider: {provider}. Use 'ollama' or 'lmstudio'")
+
+        config = providers_config[provider]
+        self.provider = provider
+        self.model = config["model"]
+        self.base_url = config["base_url"]
+        self.dimension = config["dimension"]
+
+        # OpenAI 클라이언트 초기화
+        self.client = OpenAI(
+            base_url=self.base_url,
+            api_key="not-needed"  # Ollama/LM Studio는 API key 불필요
+        )
+
+        print(f"[EmbeddingEngine] Using {provider}: {self.model}")
+        print(f"[EmbeddingEngine] API URL: {self.base_url}")
+        print(f"[EmbeddingEngine] Dimension: {self.dimension}")
+
+    def _detect_provider(self, providers_config: Dict) -> str:
+        """사용 가능한 provider 자동 감지"""
+        import requests
+
+        # Ollama 먼저 시도
+        try:
+            response = requests.get(
+                f"{providers_config['ollama']['base_url'].replace('/v1', '')}/api/tags",
+                timeout=2
+            )
+            if response.status_code == 200:
+                print("[EmbeddingEngine] Auto-detected: Ollama")
+                return "ollama"
+        except:
+            pass
+
+        # LM Studio 시도
+        try:
+            response = requests.get(
+                f"{providers_config['lmstudio']['base_url']}/models",
+                timeout=2
+            )
+            if response.status_code == 200:
+                print("[EmbeddingEngine] Auto-detected: LM Studio")
+                return "lmstudio"
+        except:
+            pass
+
+        # 기본값: ollama
+        print("[EmbeddingEngine] No provider detected, using default: ollama")
+        return "ollama"
 
     def _load_cache(self) -> Dict:
         """캐시 파일 로딩"""
@@ -71,19 +143,20 @@ class EmbeddingEngine:
             json.dump(self.cache, f, indent=2)
 
     def _get_cache_key(self, text: str) -> str:
-        """텍스트의 캐시 키 생성 (SHA256 해시)"""
-        return hashlib.sha256(text.encode('utf-8')).hexdigest()
+        """텍스트의 캐시 키 생성 (모델명 포함)"""
+        text_with_model = f"{self.model}::{text}"
+        return hashlib.sha256(text_with_model.encode('utf-8')).hexdigest()
 
     def embed_text(self, text: str, use_cache: bool = True) -> np.ndarray:
         """
-        텍스트를 384차원 벡터로 변환
+        텍스트를 벡터로 변환
 
         Args:
             text: 변환할 텍스트
             use_cache: 캐시 사용 여부
 
         Returns:
-            384차원 numpy 배열
+            768차원 numpy 배열 (nomic-embed-text 기본)
         """
         if not text or not text.strip():
             return np.zeros(self.dimension)
@@ -93,8 +166,17 @@ class EmbeddingEngine:
         if use_cache and cache_key in self.cache:
             return np.array(self.cache[cache_key])
 
-        # 임베딩 생성
-        embedding = self.model.encode(text, convert_to_numpy=True)
+        # OpenAI API로 임베딩 생성
+        try:
+            response = self.client.embeddings.create(
+                model=self.model,
+                input=text
+            )
+            embedding = np.array(response.data[0].embedding)
+        except Exception as e:
+            print(f"[ERROR] Failed to generate embedding: {e}")
+            print(f"[ERROR] Make sure {self.provider} is running and model '{self.model}' is available")
+            return np.zeros(self.dimension)
 
         # 캐시 저장
         if use_cache:
@@ -104,16 +186,72 @@ class EmbeddingEngine:
 
         return embedding
 
+    def embed_batch(self, texts: List[str], use_cache: bool = True) -> List[np.ndarray]:
+        """
+        여러 텍스트를 배치로 임베딩 (효율적)
+
+        Args:
+            texts: 텍스트 리스트
+            use_cache: 캐시 사용 여부
+
+        Returns:
+            임베딩 리스트
+        """
+        embeddings = []
+
+        # 캐시되지 않은 텍스트만 API 호출
+        uncached_texts = []
+        uncached_indices = []
+
+        for i, text in enumerate(texts):
+            cache_key = self._get_cache_key(text)
+            if use_cache and cache_key in self.cache:
+                embeddings.append(np.array(self.cache[cache_key]))
+            else:
+                uncached_texts.append(text)
+                uncached_indices.append(i)
+                embeddings.append(None)  # placeholder
+
+        # 캐시되지 않은 텍스트 배치 임베딩
+        if uncached_texts:
+            try:
+                response = self.client.embeddings.create(
+                    model=self.model,
+                    input=uncached_texts
+                )
+
+                for i, data in enumerate(response.data):
+                    embedding = np.array(data.embedding)
+                    idx = uncached_indices[i]
+                    embeddings[idx] = embedding
+
+                    # 캐시 저장
+                    if use_cache:
+                        cache_key = self._get_cache_key(uncached_texts[i])
+                        self.cache[cache_key] = embedding.tolist()
+
+                if use_cache:
+                    self._save_cache()
+
+            except Exception as e:
+                print(f"[ERROR] Failed to generate batch embeddings: {e}")
+                # Fallback: 영벡터
+                for idx in uncached_indices:
+                    if embeddings[idx] is None:
+                        embeddings[idx] = np.zeros(self.dimension)
+
+        return embeddings
+
     def embed_file(self, file_path: str, max_length: int = 10000) -> np.ndarray:
         """
         파일 내용을 임베딩으로 변환
 
         Args:
             file_path: 파일 경로
-            max_length: 최대 문자 수 (너무 긴 파일 방지)
+            max_length: 최대 문자 수
 
         Returns:
-            384차원 numpy 배열
+            벡터 (768-dim)
         """
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -128,7 +266,7 @@ class EmbeddingEngine:
         두 벡터의 코사인 유사도 계산
 
         Args:
-            emb1, emb2: 384차원 벡터
+            emb1, emb2: 벡터
 
         Returns:
             유사도 (0~1, 1이 가장 유사)
@@ -137,27 +275,15 @@ class EmbeddingEngine:
         if np.linalg.norm(emb1) == 0 or np.linalg.norm(emb2) == 0:
             return 0.0
 
-        # 코사인 유사도
         similarity = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
         return float(similarity)
 
-    def batch_embed(self, texts: List[str]) -> List[np.ndarray]:
-        """
-        여러 텍스트를 한 번에 임베딩 (효율적)
-
-        Args:
-            texts: 텍스트 리스트
-
-        Returns:
-            임베딩 리스트
-        """
-        embeddings = self.model.encode(texts, convert_to_numpy=True, show_progress_bar=True)
-        return [emb for emb in embeddings]
-
-    def find_most_similar(self,
-                         query: str,
-                         candidates: List[str],
-                         top_k: int = 5) -> List[Tuple[int, float]]:
+    def find_most_similar(
+        self,
+        query: str,
+        candidates: List[str],
+        top_k: int = 5
+    ) -> List[Tuple[int, float]]:
         """
         쿼리와 가장 유사한 후보들 찾기
 
@@ -170,22 +296,22 @@ class EmbeddingEngine:
             [(인덱스, 유사도), ...] 리스트 (유사도 내림차순)
         """
         query_emb = self.embed_text(query)
-        candidate_embs = self.batch_embed(candidates)
+        candidate_embs = self.embed_batch(candidates)
 
         similarities = [
             (i, self.cosine_similarity(query_emb, cand_emb))
             for i, cand_emb in enumerate(candidate_embs)
         ]
 
-        # 유사도 내림차순 정렬
         similarities.sort(key=lambda x: x[1], reverse=True)
-
         return similarities[:top_k]
 
-    def semantic_search(self,
-                       query: str,
-                       file_paths: List[str],
-                       top_k: int = 3) -> List[Tuple[str, float]]:
+    def semantic_search(
+        self,
+        query: str,
+        file_paths: List[str],
+        top_k: int = 3
+    ) -> List[Tuple[str, float]]:
         """
         파일들 중 쿼리와 가장 관련 있는 파일 찾기
 
@@ -205,9 +331,7 @@ class EmbeddingEngine:
             similarity = self.cosine_similarity(query_emb, file_emb)
             file_similarities.append((file_path, similarity))
 
-        # 유사도 내림차순 정렬
         file_similarities.sort(key=lambda x: x[1], reverse=True)
-
         return file_similarities[:top_k]
 
     def get_cache_stats(self) -> Dict:
@@ -216,7 +340,9 @@ class EmbeddingEngine:
             "total_cached": len(self.cache),
             "cache_size_mb": os.path.getsize(self.cache_path) / 1024 / 1024 if os.path.exists(self.cache_path) else 0,
             "dimension": self.dimension,
-            "model": "all-MiniLM-L6-v2"
+            "provider": self.provider,
+            "model": self.model,
+            "base_url": self.base_url
         }
 
     def clear_cache(self):
@@ -230,11 +356,31 @@ class EmbeddingEngine:
 # 전역 인스턴스 (싱글톤 패턴)
 _global_engine = None
 
-def get_embedding_engine() -> EmbeddingEngine:
-    """전역 임베딩 엔진 반환 (싱글톤)"""
+def get_embedding_engine(
+    provider: str = None,
+    model: str = None,
+    auto_detect: bool = True
+) -> UnifiedEmbeddingEngine:
+    """
+    전역 임베딩 엔진 반환 (싱글톤)
+
+    Args:
+        provider: "ollama" or "lmstudio" (None이면 기존 인스턴스 또는 auto-detect)
+        model: 모델 이름
+        auto_detect: 사용 가능한 provider 자동 감지
+    """
     global _global_engine
-    if _global_engine is None:
-        _global_engine = EmbeddingEngine()
+
+    # 이미 생성된 인스턴스가 있고 provider 지정 없으면 재사용
+    if _global_engine is not None and provider is None:
+        return _global_engine
+
+    # 새 인스턴스 생성
+    _global_engine = UnifiedEmbeddingEngine(
+        provider=provider or "ollama",
+        model=model,
+        auto_detect=auto_detect
+    )
     return _global_engine
 
 
@@ -254,10 +400,11 @@ def similarity(text1: str, text2: str) -> float:
 if __name__ == "__main__":
     """테스트 코드"""
     print("=" * 60)
-    print("Embedding Engine Test")
+    print("Unified Embedding Engine Test")
     print("=" * 60)
 
-    engine = EmbeddingEngine()
+    # 엔진 초기화 (auto-detect)
+    engine = UnifiedEmbeddingEngine(auto_detect=True)
 
     # 1. 기본 임베딩 테스트
     print("\n[Test 1] 기본 임베딩")
@@ -285,8 +432,19 @@ if __name__ == "__main__":
     print(f"Text 3: {text3}")
     print(f"Similarity 1-3: {sim_13:.4f} (다름)")
 
-    # 3. 의미 검색 테스트
-    print("\n[Test 3] 의미 검색")
+    # 3. 배치 임베딩 테스트
+    print("\n[Test 3] 배치 임베딩")
+    texts = [
+        "문서를 작성합니다",
+        "리포트를 생성합니다",
+        "초안을 작성합니다"
+    ]
+    batch_embs = engine.embed_batch(texts)
+    print(f"Batch size: {len(texts)}")
+    print(f"Embeddings generated: {len(batch_embs)}")
+
+    # 4. 의미 검색 테스트
+    print("\n[Test 4] 의미 검색")
     query = "보고서 작성"
     candidates = [
         "문서를 작성합니다",
@@ -302,14 +460,18 @@ if __name__ == "__main__":
     for idx, score in results:
         print(f"  {score:.4f} - {candidates[idx]}")
 
-    # 4. 캐시 통계
-    print("\n[Test 4] 캐시 통계")
+    # 5. 캐시 통계
+    print("\n[Test 5] 캐시 통계")
     stats = engine.get_cache_stats()
-    print(f"Cached embeddings: {stats['total_cached']}")
-    print(f"Cache size: {stats['cache_size_mb']:.2f} MB")
+    print(f"Provider: {stats['provider']}")
     print(f"Model: {stats['model']}")
     print(f"Dimension: {stats['dimension']}")
+    print(f"Cached embeddings: {stats['total_cached']}")
+    print(f"Cache size: {stats['cache_size_mb']:.2f} MB")
 
     print("\n" + "=" * 60)
     print("✅ All tests passed!")
     print("=" * 60)
+    print("\nNote: Make sure Ollama or LM Studio is running with nomic-embed-text model")
+    print("  Ollama: ollama pull nomic-embed-text")
+    print("  LM Studio: Download nomic-embed-text from model library")
