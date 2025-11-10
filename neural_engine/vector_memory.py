@@ -557,9 +557,382 @@ class VectorMemory:
             return "general"
 
 
+class TaskExecutionMemory:
+    """
+    Task Execution Memory: Task 실행을 Git Commit처럼 저장
+
+    핵심 개념:
+    - Before (Purpose): Task가 무엇을 하려 했는가?
+    - After (Output): Task가 실제로 무엇을 생성했는가?
+    - 유사한 과거 Task 실행을 검색하여 경험 재사용
+    """
+
+    def __init__(self, db: Optional[SupabaseDB] = None,
+                 embedding_engine: Optional[UnifiedEmbeddingEngine] = None):
+        """
+        Args:
+            db: Supabase DB 클라이언트
+            embedding_engine: 임베딩 엔진
+        """
+        self.db = db or SupabaseDB()
+        self.embedding_engine = embedding_engine or get_embedding_engine()
+
+    def save_task_execution(self,
+                           run_id: str,
+                           task_id: str,
+                           task_name: str,
+                           task_purpose: str,
+                           output_content: Optional[str] = None,
+                           output_summary: Optional[str] = None,
+                           selected_files: Optional[List[Dict]] = None,
+                           attention_weights: Optional[Dict] = None,
+                           quality_score: float = 0.0,
+                           success: bool = False,
+                           error_message: Optional[str] = None,
+                           execution_time: float = 0.0,
+                           tokens_used: int = 0) -> int:
+        """
+        Task 실행을 저장 (Git Commit처럼)
+
+        Args:
+            run_id: Run ID
+            task_id: Task ID
+            task_name: Task 이름
+            task_purpose: Task의 목적 (Before) - 임베딩됨
+            output_content: Task의 출력 (After) - 임베딩됨
+            output_summary: 출력 요약
+            selected_files: 선택된 파일 리스트
+            attention_weights: Attention 가중치
+            quality_score: 품질 점수 (0~1)
+            success: 성공 여부
+            error_message: 에러 메시지
+            execution_time: 실행 시간 (초)
+            tokens_used: 토큰 사용량
+
+        Returns:
+            task_execution_id
+        """
+        # 1. Purpose 임베딩 (Before)
+        purpose_embedding = self.embedding_engine.embed_text(task_purpose)
+
+        # 2. Output 임베딩 (After)
+        output_embedding = None
+        if output_content:
+            # 출력이 너무 길면 요약 사용
+            content_to_embed = output_summary if output_summary else output_content[:2000]
+            output_embedding = self.embedding_engine.embed_text(content_to_embed)
+
+        # 3. 자동 카테고리 분류
+        task_category = self._classify_task_purpose(task_purpose)
+
+        # 4. 데이터 준비
+        data = {
+            "run_id": run_id,
+            "task_id": task_id,
+            "task_name": task_name,
+            "task_category": task_category,
+            "task_purpose": task_purpose,
+            "purpose_embedding": purpose_embedding.tolist(),
+            "output_content": output_content,
+            "output_embedding": output_embedding.tolist() if output_embedding is not None else None,
+            "output_summary": output_summary,
+            "selected_files": selected_files if selected_files else [],
+            "attention_weights": attention_weights if attention_weights else {},
+            "quality_score": quality_score,
+            "success": success,
+            "error_message": error_message,
+            "execution_time": execution_time,
+            "tokens_used": tokens_used
+        }
+
+        # 5. 저장
+        result = self.db.client.table("task_executions") \
+            .insert(data) \
+            .execute()
+
+        task_exec_id = result.data[0]["id"]
+
+        print(f"[TaskExecutionMemory] Saved task execution: {task_id} "
+              f"(category={task_category}, quality={quality_score:.2f}, "
+              f"success={success})")
+
+        return task_exec_id
+
+    def get_similar_task_executions(self,
+                                    task_purpose: str,
+                                    success_only: bool = True,
+                                    min_quality: float = 0.7,
+                                    match_count: int = 10) -> List[Dict]:
+        """
+        유사한 과거 Task 실행 검색 (Purpose 기반)
+
+        Args:
+            task_purpose: 현재 Task의 목적
+            success_only: 성공한 것만
+            min_quality: 최소 품질
+            match_count: 반환할 개수
+
+        Returns:
+            [{task_exec_id, task_purpose, output_summary, similarity,
+              quality_score, task_category, selected_files}, ...]
+        """
+        # Purpose 임베딩
+        purpose_emb = self.embedding_engine.embed_text(task_purpose)
+
+        # pgvector 함수 호출
+        result = self.db.client.rpc("match_task_purposes", {
+            "query_embedding": purpose_emb.tolist(),
+            "success_only": success_only,
+            "min_quality": min_quality,
+            "match_count": match_count
+        }).execute()
+
+        return result.data
+
+    def get_task_recommendations(self,
+                                 task_purpose: str,
+                                 recommendation_type: str = "all") -> Dict:
+        """
+        Task 목적 기반 추천 (핵심 함수!)
+
+        과거 유사한 Task에서:
+        - 어떤 파일들을 선택했는가?
+        - 어떤 결과를 생성했는가?
+        - 어떤 접근 방식을 사용했는가?
+
+        Args:
+            task_purpose: Task의 목적
+            recommendation_type: "all", "files", "approach"
+
+        Returns:
+            {
+              "similar_tasks": [...],
+              "recommended_files": [...],
+              "suggested_approaches": [...],
+              "success_rate": 0.85,
+              "avg_quality": 0.78
+            }
+        """
+        # 1. 유사한 과거 Task 검색
+        similar_tasks = self.get_similar_task_executions(
+            task_purpose=task_purpose,
+            success_only=True,
+            min_quality=0.7,
+            match_count=10
+        )
+
+        if not similar_tasks:
+            return {
+                "similar_tasks": [],
+                "recommended_files": [],
+                "suggested_approaches": [],
+                "success_rate": 0.0,
+                "avg_quality": 0.0
+            }
+
+        # 2. 파일 추천 (빈도 + 품질 기반)
+        file_scores = {}
+        for task in similar_tasks:
+            similarity = task.get("similarity", 0.0)
+            quality = task.get("quality_score", 0.0)
+            selected_files = task.get("selected_files", [])
+
+            for file_info in selected_files:
+                if isinstance(file_info, dict):
+                    file_path = file_info.get("file_path", file_info.get("path", ""))
+                else:
+                    file_path = str(file_info)
+
+                if not file_path:
+                    continue
+
+                # 점수 계산: similarity * quality
+                score = similarity * quality
+                if file_path in file_scores:
+                    file_scores[file_path] += score
+                else:
+                    file_scores[file_path] = score
+
+        # 파일 점수 정렬
+        recommended_files = [
+            {"file_path": path, "recommendation_score": score}
+            for path, score in sorted(file_scores.items(),
+                                     key=lambda x: x[1],
+                                     reverse=True)[:10]
+        ]
+
+        # 3. 접근 방식 추천 (Output 요약 기반)
+        suggested_approaches = []
+        for task in similar_tasks[:5]:  # 상위 5개만
+            if task.get("output_summary"):
+                suggested_approaches.append({
+                    "similarity": task.get("similarity", 0.0),
+                    "quality": task.get("quality_score", 0.0),
+                    "approach": task.get("output_summary", "")
+                })
+
+        # 4. 통계
+        success_rate = len([t for t in similar_tasks if t.get("quality_score", 0) >= 0.7]) / len(similar_tasks)
+        avg_quality = np.mean([t.get("quality_score", 0.0) for t in similar_tasks])
+
+        return {
+            "similar_tasks": similar_tasks[:5],  # 상위 5개만
+            "recommended_files": recommended_files,
+            "suggested_approaches": suggested_approaches,
+            "success_rate": float(success_rate),
+            "avg_quality": float(avg_quality)
+        }
+
+    def get_execution_by_id(self, task_exec_id: int) -> Optional[Dict]:
+        """
+        Task 실행 조회 (ID 기반)
+
+        Args:
+            task_exec_id: Task execution ID
+
+        Returns:
+            Task execution 데이터 또는 None
+        """
+        result = self.db.client.table("task_executions") \
+            .select("*") \
+            .eq("id", task_exec_id) \
+            .execute()
+
+        return result.data[0] if result.data else None
+
+    def get_executions_by_category(self,
+                                   task_category: str,
+                                   success_only: bool = True,
+                                   min_quality: float = 0.7,
+                                   limit: int = 20) -> List[Dict]:
+        """
+        카테고리별 Task 실행 조회
+
+        Args:
+            task_category: Task 카테고리
+            success_only: 성공한 것만
+            min_quality: 최소 품질
+            limit: 반환할 개수
+
+        Returns:
+            Task execution 리스트
+        """
+        query = self.db.client.table("task_executions") \
+            .select("*") \
+            .eq("task_category", task_category)
+
+        if success_only:
+            query = query.eq("success", True)
+
+        query = query.gte("quality_score", min_quality) \
+                     .order("quality_score", desc=True) \
+                     .limit(limit)
+
+        result = query.execute()
+        return result.data
+
+    def get_statistics(self) -> Dict:
+        """
+        Task Execution Memory 통계
+
+        Returns:
+            {
+              "total_executions": 150,
+              "successful_executions": 120,
+              "avg_quality": 0.78,
+              "categories": {...},
+              "top_tasks": [...]
+            }
+        """
+        # 전체 실행 수
+        total_result = self.db.client.table("task_executions") \
+            .select("id", count="exact") \
+            .execute()
+        total_count = total_result.count or 0
+
+        # 성공한 실행 수
+        success_result = self.db.client.table("task_executions") \
+            .select("id", count="exact") \
+            .eq("success", True) \
+            .execute()
+        success_count = success_result.count or 0
+
+        # 평균 품질
+        all_executions = self.db.client.table("task_executions") \
+            .select("quality_score,task_category") \
+            .execute()
+
+        qualities = [e["quality_score"] for e in all_executions.data if e.get("quality_score")]
+        avg_quality = np.mean(qualities) if qualities else 0.0
+
+        # 카테고리별 통계
+        categories = {}
+        for exec_data in all_executions.data:
+            cat = exec_data.get("task_category", "unknown")
+            if cat not in categories:
+                categories[cat] = {"count": 0, "avg_quality": []}
+            categories[cat]["count"] += 1
+            if exec_data.get("quality_score"):
+                categories[cat]["avg_quality"].append(exec_data["quality_score"])
+
+        for cat in categories:
+            qualities = categories[cat]["avg_quality"]
+            categories[cat]["avg_quality"] = np.mean(qualities) if qualities else 0.0
+
+        # 상위 Task (품질 기준)
+        top_tasks = self.db.client.table("task_executions") \
+            .select("task_id,task_name,task_category,quality_score") \
+            .eq("success", True) \
+            .order("quality_score", desc=True) \
+            .limit(10) \
+            .execute()
+
+        return {
+            "total_executions": total_count,
+            "successful_executions": success_count,
+            "success_rate": success_count / total_count if total_count > 0 else 0.0,
+            "avg_quality": float(avg_quality),
+            "categories": categories,
+            "top_tasks": top_tasks.data
+        }
+
+    def _classify_task_purpose(self, task_purpose: str) -> str:
+        """
+        Task 목적을 자동 분류
+
+        Args:
+            task_purpose: Task의 목적
+
+        Returns:
+            카테고리 (analysis, coding, testing, documentation, etc)
+        """
+        purpose_lower = task_purpose.lower()
+
+        # 키워드 기반 분류
+        if any(word in purpose_lower for word in ['analyze', 'understand', 'review', '분석', '검토', '이해']):
+            return "analysis"
+        elif any(word in purpose_lower for word in ['code', 'implement', 'develop', '코드', '구현', '개발']):
+            return "coding"
+        elif any(word in purpose_lower for word in ['test', 'testing', 'validate', '테스트', '검증']):
+            return "testing"
+        elif any(word in purpose_lower for word in ['document', 'doc', 'write', '문서', '작성']):
+            return "documentation"
+        elif any(word in purpose_lower for word in ['refactor', 'clean', 'improve', '리팩토링', '정리', '개선']):
+            return "refactoring"
+        elif any(word in purpose_lower for word in ['fix', 'bug', 'error', '수정', '버그', '오류']):
+            return "bug_fix"
+        elif any(word in purpose_lower for word in ['design', 'plan', 'architecture', '설계', '계획']):
+            return "design"
+        elif any(word in purpose_lower for word in ['integrate', 'connect', '통합', '연결']):
+            return "integration"
+        else:
+            return "general"
+
+
 # ==================== Global Instance ====================
 
 _global_vector_memory: Optional[VectorMemory] = None
+_global_task_execution_memory: Optional[TaskExecutionMemory] = None
 
 
 def get_vector_memory() -> VectorMemory:
@@ -568,6 +941,14 @@ def get_vector_memory() -> VectorMemory:
     if _global_vector_memory is None:
         _global_vector_memory = VectorMemory()
     return _global_vector_memory
+
+
+def get_task_execution_memory() -> TaskExecutionMemory:
+    """전역 TaskExecutionMemory 인스턴스 반환 (싱글톤)"""
+    global _global_task_execution_memory
+    if _global_task_execution_memory is None:
+        _global_task_execution_memory = TaskExecutionMemory()
+    return _global_task_execution_memory
 
 
 if __name__ == "__main__":

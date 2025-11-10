@@ -188,7 +188,10 @@ class NeuralTask:
                                 quality_score: float,
                                 execution_time: float,
                                 token_used: int,
-                                output_path: str):
+                                output_path: str,
+                                output_content: Optional[str] = None,
+                                output_summary: Optional[str] = None,
+                                auto_save_to_memory: bool = True):
         """
         실행 결과 기록
 
@@ -197,6 +200,9 @@ class NeuralTask:
             execution_time: 실행 시간 (초)
             token_used: 사용한 토큰 수
             output_path: 결과 파일 경로
+            output_content: 출력 내용 (Task Execution Memory 저장용)
+            output_summary: 출력 요약 (Task Execution Memory 저장용)
+            auto_save_to_memory: Task Execution Memory에 자동 저장 여부
         """
         self.quality_score = quality_score
         self.execution_time = execution_time
@@ -209,6 +215,102 @@ class NeuralTask:
 
         # 신뢰도 계산 (품질 점수 기반)
         self.confidence = quality_score
+
+        # Task Execution Memory에 자동 저장 (선택적)
+        if auto_save_to_memory:
+            try:
+                self.save_to_execution_memory(
+                    output_content=output_content,
+                    output_summary=output_summary
+                )
+            except Exception as e:
+                # 메모리 저장 실패해도 Task 실행은 성공으로 간주
+                print(f"[WARNING] Failed to save to Task Execution Memory: {e}")
+
+    def save_to_execution_memory(self,
+                                 output_content: Optional[str] = None,
+                                 output_summary: Optional[str] = None):
+        """
+        Task 실행을 Task Execution Memory에 저장
+
+        Args:
+            output_content: Task의 출력 내용
+            output_summary: 출력 요약 (긴 출력의 경우)
+        """
+        try:
+            from .vector_memory import get_task_execution_memory
+
+            task_memory = get_task_execution_memory()
+
+            # 선택된 파일 정보 준비
+            selected_files_data = []
+            if self.selected_files:
+                for file_path in self.selected_files:
+                    attention_weight = self.attention_weights.get(file_path, 0.0)
+                    selected_files_data.append({
+                        "file_path": file_path,
+                        "attention_weight": attention_weight
+                    })
+
+            # Task 실행 저장
+            task_exec_id = task_memory.save_task_execution(
+                run_id=self.run_id,
+                task_id=self.task_id,
+                task_name=self.task_name,
+                task_purpose=self.task_purpose,
+                output_content=output_content,
+                output_summary=output_summary,
+                selected_files=selected_files_data,
+                attention_weights=self.attention_weights,
+                quality_score=self.quality_score,
+                success=(self.quality_score >= 0.7),  # 0.7 이상을 성공으로 간주
+                execution_time=self.execution_time,
+                tokens_used=self.token_used
+            )
+
+            print(f"[NeuralTask] Saved to Task Execution Memory: ID={task_exec_id}")
+
+        except ImportError:
+            # Task Execution Memory가 없으면 스킵
+            pass
+        except Exception as e:
+            print(f"[WARNING] Task Execution Memory save failed: {e}")
+
+    def get_past_execution_recommendations(self) -> Optional[Dict]:
+        """
+        과거 유사한 Task 실행에서 추천 정보 가져오기
+
+        Returns:
+            {
+              "similar_tasks": [...],
+              "recommended_files": [...],
+              "suggested_approaches": [...],
+              "success_rate": 0.85,
+              "avg_quality": 0.78
+            }
+            또는 None (메모리 없을 경우)
+        """
+        try:
+            from .vector_memory import get_task_execution_memory
+
+            task_memory = get_task_execution_memory()
+
+            # 현재 Task의 purpose로 유사한 과거 실행 검색
+            recommendations = task_memory.get_task_recommendations(
+                task_purpose=self.task_purpose
+            )
+
+            if recommendations["similar_tasks"]:
+                print(f"[NeuralTask] Found {len(recommendations['similar_tasks'])} "
+                      f"similar past executions (avg quality: {recommendations['avg_quality']:.2f})")
+
+            return recommendations
+
+        except ImportError:
+            return None
+        except Exception as e:
+            print(f"[WARNING] Failed to get recommendations: {e}")
+            return None
 
     def to_dict(self) -> Dict:
         """Dict로 변환 (DB 저장용)"""

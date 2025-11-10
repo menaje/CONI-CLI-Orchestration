@@ -17,6 +17,12 @@ from .neural_task import NeuralTask
 from .validator import NeuralValidator
 from .weight_manager import WeightManager
 from .attention import AttentionMechanism
+from .vector_memory import (
+    VectorMemory,
+    TaskExecutionMemory,
+    get_vector_memory,
+    get_task_execution_memory
+)
 
 __all__ = [
     'EmbeddingEngine',
@@ -24,4 +30,8 @@ __all__ = [
     'NeuralValidator',
     'WeightManager',
     'AttentionMechanism',
+    'VectorMemory',
+    'TaskExecutionMemory',
+    'get_vector_memory',
+    'get_task_execution_memory',
 ]

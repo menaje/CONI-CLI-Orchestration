@@ -557,6 +557,234 @@ $$;
 
 COMMENT ON FUNCTION get_learned_file_recommendations IS 'Get file recommendations based on learned patterns from similar contexts';
 
+-- ==================== Task Execution Memory (NEW) ====================
+
+-- Task Executions: Task 실행을 Git Commit처럼 저장
+CREATE TABLE IF NOT EXISTS task_executions (
+  id SERIAL PRIMARY KEY,
+
+  -- Task 식별
+  run_id VARCHAR(10) NOT NULL,
+  task_id VARCHAR(10) NOT NULL,
+  task_name VARCHAR(200),
+  task_category VARCHAR(50),
+
+  -- Before (Input): Task의 목적
+  task_purpose TEXT NOT NULL,
+  purpose_embedding VECTOR(768),
+
+  -- After (Output): Task의 결과
+  output_content TEXT,
+  output_embedding VECTOR(768),
+  output_summary TEXT,
+
+  -- 실행 정보
+  selected_files JSONB,
+  attention_weights JSONB,
+
+  -- 품질 및 성공 여부
+  quality_score FLOAT,
+  success BOOLEAN DEFAULT FALSE,
+  error_message TEXT,
+
+  -- 리소스 사용
+  execution_time FLOAT,
+  tokens_used INT,
+
+  -- 시간
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+
+  FOREIGN KEY (run_id) REFERENCES process_runs(run_id) ON DELETE CASCADE
+);
+
+COMMENT ON TABLE task_executions IS 'Task executions stored like git commits (Before + After)';
+COMMENT ON COLUMN task_executions.task_purpose IS 'What the task was meant to do (Before)';
+COMMENT ON COLUMN task_executions.purpose_embedding IS 'Task purpose embedding for similarity search';
+COMMENT ON COLUMN task_executions.output_content IS 'What the task actually produced (After)';
+COMMENT ON COLUMN task_executions.output_embedding IS 'Output embedding for result similarity search';
+COMMENT ON COLUMN task_executions.task_category IS 'Auto-classified task type (analysis, coding, testing, etc)';
+
+-- HNSW indexes for fast vector search
+CREATE INDEX IF NOT EXISTS idx_task_exec_purpose_vector
+  ON task_executions USING hnsw (purpose_embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_task_exec_output_vector
+  ON task_executions USING hnsw (output_embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_task_exec_run ON task_executions(run_id);
+CREATE INDEX IF NOT EXISTS idx_task_exec_category ON task_executions(task_category);
+CREATE INDEX IF NOT EXISTS idx_task_exec_success ON task_executions(success);
+CREATE INDEX IF NOT EXISTS idx_task_exec_quality ON task_executions(quality_score DESC);
+
+-- Code Changes (Git Diff Memory): 개발자 경험 자산 저장
+CREATE TABLE IF NOT EXISTS code_changes (
+  id SERIAL PRIMARY KEY,
+
+  -- Git 정보
+  commit_hash VARCHAR(40) UNIQUE NOT NULL,
+  commit_message TEXT NOT NULL,
+  author_name VARCHAR(100),
+  author_email VARCHAR(100),
+  committed_at TIMESTAMPTZ,
+
+  -- Problem (Before): 무엇을 해결하려 했는가?
+  problem_description TEXT NOT NULL,
+  problem_embedding VECTOR(768),
+  problem_category VARCHAR(50),
+
+  -- Solution (After): 어떻게 해결했는가?
+  diff_content TEXT NOT NULL,
+  diff_embedding VECTOR(768),
+  diff_summary TEXT,
+
+  -- 메타데이터
+  files_changed JSONB,
+  lines_added INT,
+  lines_deleted INT,
+
+  -- 품질 지표
+  quality_score FLOAT,
+  usefulness_score FLOAT,
+  complexity_score FLOAT,
+
+  -- 태그 및 분류
+  tags TEXT[],
+  languages TEXT[],
+  frameworks TEXT[],
+
+  -- 재사용 통계
+  reference_count INT DEFAULT 0,
+  last_referenced_at TIMESTAMPTZ,
+
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+COMMENT ON TABLE code_changes IS 'Git commit diffs stored as vectors for experience-based problem solving';
+COMMENT ON COLUMN code_changes.problem_description IS 'What problem was being solved (extracted from commit message)';
+COMMENT ON COLUMN code_changes.problem_embedding IS 'Problem description embedding for similarity search';
+COMMENT ON COLUMN code_changes.diff_content IS 'The actual code changes (git diff)';
+COMMENT ON COLUMN code_changes.diff_embedding IS 'Diff embedding for solution similarity search';
+COMMENT ON COLUMN code_changes.quality_score IS 'Estimated quality of the solution (0~1)';
+
+-- HNSW indexes for fast vector search
+CREATE INDEX IF NOT EXISTS idx_code_changes_problem_vector
+  ON code_changes USING hnsw (problem_embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_code_changes_diff_vector
+  ON code_changes USING hnsw (diff_embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_code_changes_commit ON code_changes(commit_hash);
+CREATE INDEX IF NOT EXISTS idx_code_changes_category ON code_changes(problem_category);
+CREATE INDEX IF NOT EXISTS idx_code_changes_quality ON code_changes(quality_score DESC);
+CREATE INDEX IF NOT EXISTS idx_code_changes_tags ON code_changes USING gin(tags);
+CREATE INDEX IF NOT EXISTS idx_code_changes_reference ON code_changes(reference_count DESC);
+
+-- ==================== Task & Code Change Search Functions ====================
+
+-- 6. Find similar task executions by purpose
+CREATE OR REPLACE FUNCTION match_task_purposes(
+  query_embedding VECTOR(768),
+  success_only BOOLEAN DEFAULT TRUE,
+  min_quality FLOAT DEFAULT 0.7,
+  match_count INT DEFAULT 10
+)
+RETURNS TABLE (
+  task_exec_id INT,
+  task_purpose TEXT,
+  output_summary TEXT,
+  similarity FLOAT,
+  quality_score FLOAT,
+  task_category VARCHAR(50),
+  selected_files JSONB
+)
+LANGUAGE SQL
+STABLE
+AS $$
+  SELECT
+    id AS task_exec_id,
+    task_purpose,
+    output_summary,
+    1 - (purpose_embedding <=> query_embedding) AS similarity,
+    quality_score,
+    task_category,
+    selected_files
+  FROM task_executions
+  WHERE
+    (NOT success_only OR success = TRUE)
+    AND quality_score >= min_quality
+    AND purpose_embedding IS NOT NULL
+  ORDER BY purpose_embedding <=> query_embedding
+  LIMIT match_count;
+$$;
+
+COMMENT ON FUNCTION match_task_purposes IS 'Find similar past task executions by task purpose';
+
+-- 7. Find similar code solutions by problem
+CREATE OR REPLACE FUNCTION match_code_problems(
+  query_embedding VECTOR(768),
+  min_quality FLOAT DEFAULT 0.6,
+  match_count INT DEFAULT 10
+)
+RETURNS TABLE (
+  code_change_id INT,
+  commit_hash VARCHAR(40),
+  problem_description TEXT,
+  diff_summary TEXT,
+  similarity FLOAT,
+  quality_score FLOAT,
+  problem_category VARCHAR(50)
+)
+LANGUAGE SQL
+STABLE
+AS $$
+  SELECT
+    id AS code_change_id,
+    commit_hash,
+    problem_description,
+    diff_summary,
+    1 - (problem_embedding <=> query_embedding) AS similarity,
+    quality_score,
+    problem_category
+  FROM code_changes
+  WHERE
+    quality_score >= min_quality
+    AND problem_embedding IS NOT NULL
+  ORDER BY problem_embedding <=> query_embedding
+  LIMIT match_count;
+$$;
+
+COMMENT ON FUNCTION match_code_problems IS 'Find similar code solutions by problem description';
+
+-- 8. Find similar code solutions by diff content
+CREATE OR REPLACE FUNCTION match_code_diffs(
+  query_embedding VECTOR(768),
+  min_quality FLOAT DEFAULT 0.6,
+  match_count INT DEFAULT 10
+)
+RETURNS TABLE (
+  code_change_id INT,
+  commit_hash VARCHAR(40),
+  problem_description TEXT,
+  diff_content TEXT,
+  similarity FLOAT,
+  quality_score FLOAT
+)
+LANGUAGE SQL
+STABLE
+AS $$
+  SELECT
+    id AS code_change_id,
+    commit_hash,
+    problem_description,
+    diff_content,
+    1 - (diff_embedding <=> query_embedding) AS similarity,
+    quality_score
+  FROM code_changes
+  WHERE
+    quality_score >= min_quality
+    AND diff_embedding IS NOT NULL
+  ORDER BY diff_embedding <=> query_embedding
+  LIMIT match_count;
+$$;
+
+COMMENT ON FUNCTION match_code_diffs IS 'Find similar code solutions by diff content';
+
 -- ==================== Utility Functions ====================
 
 -- Auto-update timestamp function
