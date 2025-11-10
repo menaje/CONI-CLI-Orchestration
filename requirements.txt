@@ -1,0 +1,24 @@
+# Neural-CONI Dependencies
+
+# Core Dependencies (OpenAI SDK for Ollama/LM Studio)
+openai>=1.0.0
+numpy==1.24.3
+scipy==1.10.1
+scikit-learn==1.3.0
+requests>=2.31.0
+
+# Database
+supabase>=2.0.0
+python-dotenv>=1.0.0
+
+# Data Processing
+pandas==2.0.3
+
+# Async Execution
+asyncio==3.4.3
+
+# Visualization (Optional)
+matplotlib==3.7.2
+
+# Existing CONI dependencies (if any)
+# Add existing dependencies here
